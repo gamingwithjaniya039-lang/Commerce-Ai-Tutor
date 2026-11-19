@@ -1,0 +1,313 @@
+// ============================================================================
+// COMMERCE AI TUTOR 2027 — COMPLETE SINGLE-FILE APP
+// Run:  npm install express dotenv   →   node app.js
+// ============================================================================
+require('dotenv').config();
+const express = require('express');
+
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const MODEL = 'gemini-2.5-flash';
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+
+// ======================= RATE LIMITING =======================
+const hits = new Map();
+function rateLimit(req, res, next) {
+  const ip = req.ip, now = Date.now();
+  const rec = hits.get(ip) || { count: 0, reset: now + 60000 };
+  if (now > rec.reset) { rec.count = 0; rec.reset = now + 60000; }
+  rec.count++; hits.set(ip, rec);
+  if (rec.count > 20) return res.status(429).json({ error: 'Too many requests. Wait a minute.' });
+  next();
+}
+
+// ======================= FORMULA ENGINE ======================
+const Calc = {
+  depreciationSL({ cost, salvage, life }) {
+    if (life <= 0) throw new Error('Useful life must be greater than 0.');
+    const annual = (cost - salvage) / life;
+    return {
+      formula: 'Annual Depreciation = (Cost − Salvage Value) ÷ Useful Life',
+      substitution: `= (${fmt(cost)} − ${fmt(salvage)}) ÷ ${life}`,
+      steps: [`Cost − Salvage = ${fmt(cost - salvage)}`, `${fmt(cost - salvage)} ÷ ${life} = ${fmt(annual)}`],
+      answer: `Annual depreciation = ${fmt(annual)} per year`
+    };
+  },
+  elasticity({ p1, p2, q1, q2 }) {
+    const dq = (q2 - q1) / ((q1 + q2) / 2);
+    const dp = (p2 - p1) / ((p1 + p2) / 2);
+    if (dp === 0) throw new Error('Price did not change — elasticity is undefined.');
+    const e = dq / dp;
+    const type = Math.abs(e) > 1 ? 'Elastic' : Math.abs(e) < 1 ? 'Inelastic' : 'Unit elastic';
+    return {
+      formula: 'PED = (ΔQ ÷ avg Q) ÷ (ΔP ÷ avg P)  [midpoint method]',
+      substitution: `= ((${q2} − ${q1}) ÷ ${(q1+q2)/2}) ÷ ((${p2} − ${p1}) ÷ ${(p1+p2)/2})`,
+      steps: [`ΔQ% = ${(dq*100).toFixed(2)}%`, `ΔP% = ${(dp*100).toFixed(2)}%`, `PED = ${e.toFixed(4)} ≈ ${e.toFixed(2)}`],
+      answer: `PED ≈ ${e.toFixed(2)} → Demand is ${type}`
+    };
+  },
+  convert({ value, from, to }) {
+    const bases = { binary: 2, octal: 8, decimal: 10, hexadecimal: 16 };
+    const fb = bases[from], tb = bases[to];
+    const n = parseInt(String(value), fb);
+    if (isNaN(n)) throw new Error(`"${value}" is not a valid ${from} number.`);
+    const result = n.toString(tb).toUpperCase();
+    const steps = [];
+    if (from === 'binary') {
+      let sum = 0;
+      String(value).split('').reverse().forEach((b, i) => { if (b === '1') { sum += 2 ** i; steps.push(`1×2^${i} = ${2**i}`); } });
+      steps.push(`Sum = ${n}`);
+    }
+    if (from === 'decimal' && to === 'binary') {
+      let x = n; const bits = [];
+      while (x > 0) { bits.unshift(x % 2); steps.push(`${x} ÷ 2 = ${Math.floor(x/2)} remainder ${x%2}`); x = Math.floor(x / 2); }
+      steps.push(`Read remainders bottom-up → ${bits.join('')}`);
+    }
+    return { formula: `${from} → ${to} (base ${fb} → base ${tb})`, substitution: `${value} base ${fb}`,
+      steps: steps.length ? steps : ['Direct conversion'], answer: `= ${result}` };
+  },
+  truthTable({ gate }) {
+    const g = gate.toUpperCase();
+    const ops = { AND:(a,b)=>a&b, OR:(a,b)=>a|b, XOR:(a,b)=>a^b, NAND:(a,b)=>~(a&b)&1, NOR:(a,b)=>~(a|b)&1, XNOR:(a,b)=>~(a^b)&1 };
+    if (g === 'NOT') return { formula:'NOT gate (inverter)', substitution:'Y = NOT A', steps:[],
+      answer:'A | Y\n0 | 1\n1 | 0' };
+    if (!ops[g]) throw new Error('Supported gates: AND OR NOT NAND NOR XOR XNOR');
+    const rows = [[0,0],[0,1],[1,0],[1,1]].map(([a,b]) => `${a} ${b} | ${ops[g](a,b)}`);
+    return { formula:`${g} gate truth table`, substitution:`Boolean: Y = A ${g==='AND'?'·':g==='OR'?'+':g} B`,
+      steps:['Evaluate the gate for all 4 input combinations of A and B'],
+      answer:`A B | Y\n${rows.join('\n')}` };
+  }
+};
+
+function fmt(n) {
+  return Number.isInteger(n) ? n.toLocaleString('en-US') : n.toLocaleString('en-US', {maximumFractionDigits:2});
+}
+
+function tryCalculation(message) {
+  const m = message.toLowerCase();
+
+  let depMatch = m.match(/(?:cost|price)?\s*(?:rs\.?|lkr)?\s*([\d,]+).*?(?:salvage|residual|scrap)[^\d]*([\d,]+).*?(?:life|years)[^\d]*(\d+)/s)
+    || (m.includes('depreciation') && m.match(/([\d,]+)[^\d]+(?:salvage|residual)[^\d]*([\d,]+)[^\d]*(?:life|years)[^\d]*(\d+)/s));
+  if (m.includes('depreciation') && depMatch) {
+    const [, c, s, l] = depMatch;
+    return Calc.depreciationSL({ cost:+c.replace(/,/g,''), salvage:+s.replace(/,/g,''), life:+l });
+  }
+
+  if (m.includes('elastic')) {
+    const nums = [...m.matchAll(/[\d.]+/g)].map(x => parseFloat(x[0]));
+    if (nums.length >= 4) return Calc.elasticity({ p1:nums[0], p2:nums[1], q1:nums[2], q2:nums[3] });
+  }
+
+  const bases = ['binary','octal','decimal','hexadecimal','hex'];
+  const conv = m.match(/([\w.]+)\s*(binary|octal|decimal|hexadecimal|hex)\s*(?:to|into)\s*(binary|octal|decimal|hexadecimal|hex)/)
+        || m.match(/(binary|octal|decimal|hexadecimal|hex)\s*(?:to|into)\s*(binary|octal|decimal|hexadecimal|hex)\s*(?:of\s*)?([\w.]+)/);
+  if (conv) {
+    let value, from, to;
+    if (!bases.includes(conv[1])) { value = conv[1]; from = conv[2]; to = conv[3]; }
+    else { from = conv[1]; to = conv[2]; value = conv[3]; }
+    from = from === 'hex' ? 'hexadecimal' : from;
+    to = to === 'hex' ? 'hexadecimal' : to;
+    if (from !== to && value) return Calc.convert({ value, from, to });
+  }
+
+  const tt = m.match(/truth table(?:\s*(?:for|of)\s*|\s+)?(and|or|not|nand|nor|xor|xnor)\b/) || m.match(/\b(and|or|not|nand|nor|xor|xnor)\s+gate\b.*truth/);
+  if (tt) return Calc.truthTable({ gate: tt[1] });
+  if (m.includes('truth table')) {
+    const g = (m.match(/(and|or|not|nand|nor|xor|xnor)/) || [])[1];
+    if (g) return Calc.truthTable({ gate: g });
+  }
+  return null;
+}
+
+// ======================= SUBJECT ROUTING =======================
+const SUBJECT_HINTS = {
+  ICT: ["logic gate","binary","two's complement","database","normalization","sql","python","algorithm","flowchart","hexadecimal","boolean","truth table"],
+  Accounting: ["journal","ledger","trial balance","depreciation","inventory","bank reconciliation","financial statement","double entry","capital"],
+  Economics: ["demand","supply","elasticity","inflation","national income","opportunity cost","market equilibrium","monetary policy","fiscal"],
+  "Business Studies": ["entrepreneur","management","marketing","human resource","business plan","leadership","organizing","business environment"]
+};
+function detectSubject(text) {
+  const t = text.toLowerCase();
+  let best = null, bestScore = 0;
+  for (const [s, words] of Object.entries(SUBJECT_HINTS)) {
+    const score = words.filter(w => t.includes(w)).length;
+    if (score > bestScore) { bestScore = score; best = s; }
+  }
+  return best || 'General';
+}
+
+const SYSTEM_BY_SUBJECT = {
+  ICT: "You are an expert Sri Lankan G.C.E. A/L ICT tutor. Cover data representation, logic gates with truth tables, databases/normalization, Python, algorithms, computer systems. Show truth tables and step-by-step conversions when relevant.",
+  Accounting: "You are an expert Sri Lankan G.C.E. A/L Accounting tutor. Always show debit/credit reasoning, the accounting equation check, formulas, substitutions, and step-by-step workings. Never invent LKAS/SLFRS rules.",
+  Economics: "You are an expert Sri Lankan G.C.E. A/L Economics tutor. Give definitions, equations, worked numerical examples, graph interpretations, and economic intuition.",
+  "Business Studies": "You are an expert Sri Lankan G.C.E. A/L Business Studies tutor. Give definitions, structured explanations, advantages/disadvantages, and practical examples.",
+  General: "You are a helpful Sri Lankan G.C.E. A/L tutor for Commerce and ICT subjects."
+};
+
+// ======================= API =======================
+app.post('/api/chat', rateLimit, async (req, res) => {
+  const { message, subject, grade, language, image } = req.body || {};
+  if (!message || typeof message !== 'string' || message.length > 4000)
+    return res.status(400).json({ error: 'Invalid message.' });
+
+  const subj = (subject && subject !== 'auto') ? subject : detectSubject(message);
+
+  // 1) Deterministic calculation engine — exact answers, no AI guessing
+  if (!image) {
+    try {
+      const calc = tryCalculation(message);
+      if (calc) {
+        const out = `⚙️ Solved with the Formula Engine (exact calculation)\n\nFormula: ${calc.formula}\nSubstitution: ${calc.substitution}\n\nSteps:\n${calc.steps.map((s,i)=>`${i+1}. ${s}`).join('\n')}\n\n✅ Final answer: ${calc.answer}`;
+        return res.json({ answer: out, subject: subj, engine: 'formula' });
+      }
+    } catch (e) {
+      return res.json({ answer: `⚠️ Formula Engine could not compute this: ${e.message}\nPlease check the numbers in your question and try again.`, subject: subj, engine: 'formula' });
+    }
+  }
+
+  // 2) Otherwise → Gemini
+  if (!GEMINI_KEY)
+    return res.status(500).json({ error: 'Server misconfiguration: GEMINI_API_KEY is not set.' });
+
+  const langNote = {
+    'Sinhala': 'Answer in clear Sinhala Unicode. Keep standard technical terms in English where natural.',
+    'Singlish': 'Answer in Singlish (romanized Sinhala).',
+    'English': 'Answer in clear English.'
+  }[language] || "Match the language of the student's question.";
+
+  const system = SYSTEM_BY_SUBJECT[subj] + ' ' + langNote +
+    (grade ? ` The student is in ${grade}.` : '') +
+    ' Structure: direct answer, definition, explanation, step-by-step working where needed, an example, and exam tips when useful.';
+
+  const parts = [{ text: message }];
+  if (image) parts.push({ inline_data: { mime_type: 'image/jpeg', data: image } });
+
+  const body = {
+    system_instruction: { parts: [{ text: system }] },
+    contents: [{ parts }],
+    generationConfig: { temperature: 0.4, maxOutputTokens: 2048 }
+  };
+
+  async function callOnce() {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    try {
+      return await fetch(`${API_URL}?key=${GEMINI_KEY}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: ctrl.signal
+      });
+    } finally { clearTimeout(timer); }
+  }
+
+  try {
+    let r = await callOnce();
+    if (r.status >= 500) r = await callOnce();
+    if (r.status === 429) return res.status(429).json({ error: 'AI quota exceeded. Try again shortly.' });
+    if (r.status === 400 || r.status === 403) return res.status(502).json({ error: 'AI credentials invalid. Check server GEMINI_API_KEY.' });
+    if (!r.ok) return res.status(502).json({ error: `AI provider error (${r.status}).` });
+    const data = await r.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('');
+    if (!text) return res.status(502).json({ error: 'AI returned an empty/malformed response.' });
+    res.json({ answer: text, subject: subj, engine: 'gemini' });
+  } catch (e) {
+    res.status(504).json({ error: e.name === 'AbortError' ? 'Request timed out.' : 'Network error contacting AI provider.' });
+  }
+});
+
+// ======================= FRONTEND =======================
+const HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Commerce AI Tutor 2027</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--accent:#38bdf8;--text:#e2e8f0}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
+header{padding:14px 20px;background:var(--card);font-size:1.1rem;font-weight:600;border-bottom:1px solid #334155}
+header span{color:var(--accent)}
+.controls{display:flex;gap:10px;padding:12px 20px;background:var(--card);flex-wrap:wrap}
+select,button,input[type=file]::file-selector-button{background:#0f172a;color:var(--text);border:1px solid #475569;border-radius:8px;padding:8px 12px;font-size:.9rem}
+.hint{padding:8px 20px;font-size:.78rem;color:#94a3b8;background:var(--card);border-bottom:1px solid #334155}
+#chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
+.msg{max-width:85%;padding:12px 16px;border-radius:14px;white-space:pre-wrap;line-height:1.55;font-size:.95rem}
+.user{align-self:flex-end;background:#0369a1}
+.bot{align-self:flex-start;background:var(--card);border:1px solid #334155}
+.tag{font-size:.72rem;color:var(--accent);display:block;margin-bottom:6px}
+.err{align-self:center;background:#7f1d1d;padding:10px 16px;border-radius:10px}
+.composer{display:flex;gap:10px;padding:14px 20px;background:var(--card);border-top:1px solid #334155;align-items:flex-end}
+textarea{flex:1;background:#0f172a;color:var(--text);border:1px solid #475569;border-radius:10px;padding:12px;resize:none;font-family:inherit;font-size:.95rem}
+#send{background:var(--accent);color:#0f172a;font-weight:700;border:none;cursor:pointer;padding:12px 22px;border-radius:10px}
+#send:disabled{opacity:.5;cursor:wait}
+.img-preview{max-height:70px;border-radius:8px}
+.imgbox{display:flex;flex-direction:column;gap:6px}
+.imgbox label{font-size:.8rem}
+</style>
+</head>
+<body>
+<header>📚 Commerce <span>AI Tutor</span> 2027 — A/L Commerce & ICT</header>
+<div class="controls">
+  <select id="subject"><option value="auto">Auto-detect subject</option><option>Accounting</option><option>Economics</option><option>Business Studies</option><option>ICT</option></select>
+  <select id="grade"><option>Grade 12</option><option>Grade 13</option><option>A/L Revision</option></select>
+  <select id="language"><option>Auto</option><option>English</option><option>Sinhala</option><option>Singlish</option></select>
+  <button id="clear">Clear chat</button>
+</div>
+<div class="hint">⚙️ Formula engine (exact, no AI): try "depreciation cost 50000 salvage 5000 life 5" · "price 10 to 12 quantity 100 to 80 elasticity" · "1011 binary to decimal" · "truth table AND"</div>
+<div id="chat"></div>
+<div class="composer">
+  <div class="imgbox">
+    <label>📷 Question image</label>
+    <input type="file" id="img" accept="image/*">
+    <img id="preview" class="img-preview" style="display:none">
+  </div>
+  <textarea id="input" rows="2" placeholder="Ask any Accounting, Economics, Business Studies or ICT question…"></textarea>
+  <button id="send">Send</button>
+</div>
+<script>
+const chat=document.getElementById('chat'),input=document.getElementById('input'),sendBtn=document.getElementById('send'),imgInput=document.getElementById('img'),preview=document.getElementById('preview');
+let imgData=null;
+imgInput.addEventListener('change',()=>{
+  const f=imgInput.files[0];
+  if(!f){imgData=null;preview.style.display='none';return;}
+  if(f.size>5*1024*1024){alert('Image too large (max 5MB)');imgInput.value='';return;}
+  const r=new FileReader();
+  r.onload=e=>{imgData=e.target.result.split(',')[1];preview.src=e.target.result;preview.style.display='block';};
+  r.readAsDataURL(f);
+});
+function addMsg(text,who,tag){
+  const d=document.createElement('div');d.className='msg '+who;d.textContent=text;
+  if(tag){const t=document.createElement('span');t.className='tag';t.textContent=tag;d.prepend(t);}
+  chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d;
+}
+async function send(){
+  const msg=input.value.trim();if(!msg)return;
+  addMsg(msg,'user');input.value='';sendBtn.disabled=true;
+  const thinking=addMsg('Thinking…','bot');
+  try{
+    const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:msg,subject:document.getElementById('subject').value,
+        grade:document.getElementById('grade').value,language:document.getElementById('language').value,image:imgData})});
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||'Request failed');
+    thinking.remove();
+    addMsg(data.answer,'bot','Subject: '+data.subject+(data.engine==='formula'?' · Formula Engine':' · Gemini AI'));
+  }catch(e){
+    thinking.remove();
+    const err=document.createElement('div');err.className='err';err.textContent='⚠️ '+e.message;
+    chat.appendChild(err);chat.scrollTop=chat.scrollHeight;
+  }
+  sendBtn.disabled=false;
+}
+sendBtn.addEventListener('click',send);
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+document.getElementById('clear').addEventListener('click',()=>chat.innerHTML='');
+</script>
+</body>
+</html>`;
+
+app.get('/', (req, res) => res.send(HTML));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Commerce AI Tutor running at http://localhost:${PORT}`));
